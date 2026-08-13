@@ -14,29 +14,11 @@
 
 ## AWQ
 
-AWQ 根据校准时的激活分布保护重要通道。本机 MiniCPM-o 4.5 的入口是：
-
-```text
-/cache/shitong/autoAWQ/use_awq/quantized.py
-```
-
-模型适配位于：
-
-```text
-/cache/shitong/autoAWQ/AutoAWQ/awq/models/minicpmo.py
-```
-
-量化配置为 W4、group size 128、GEMM。适配代码在量化阶段切换到 `model.llm`，保存后再复制非权重配置文件。
+AWQ 根据校准时的激活分布保护重要通道。为 MiniCPM-o 增加模型适配后，量化阶段切换到 `model.llm`，使用 W4、group size 128、GEMM 配置，保存后再合并非权重配置文件。
 
 ## GPTQ
 
-GPTQ 对 LLM 各层进行逐层误差补偿量化。本机 MiniCPM-o 4.5 的入口是：
-
-```text
-/cache/shitong/autoGPTQ/use_gptq/quantize_minicpmo_o45.py
-```
-
-脚本先提取 `full_model.llm`，按 Qwen3 结构做 4 bit GPTQ，再把量化 LLM 与原模型中未量化的多模态权重合并，最终生成可供 transformers 和 vLLM 加载的 checkpoint。
+GPTQ 对 LLM 各层进行逐层误差补偿量化。实现先提取 `full_model.llm`，按 Qwen3 结构做 4 bit GPTQ，再把量化 LLM 与原模型中未量化的多模态权重合并，最终生成可供 Transformers 和 vLLM 加载的 checkpoint。
 
 ## 新模型适配要点
 
@@ -44,14 +26,19 @@ GPTQ 对 LLM 各层进行逐层误差补偿量化。本机 MiniCPM-o 4.5 的入�
 - `in_proj_a`、`in_proj_b` 等小维度层通常参与 scaling，但不直接量化。
 - GPTQ 合并权重时需要检查 state dict 前缀，避免 `llm.`、`model.language_model.` 或 tied `lm_head` 重复。
 - 校准阶段如果 KV cache 持续增长导致 OOM，需要关闭 cache 或清理 `past_key_values`。
-- CPMOCR 的 AWQ/GPTQ 与验证脚本已经存在，但本机未找到对应量化输出目录，因此只能确认适配代码完成，不能确认最终模型已经跑完。
+- CPMOCR 的 AWQ/GPTQ 适配与验证流程已经完成，但最终量化 checkpoint 未保留，因此不把它表述为完整交付结果。
 
-相关脚本：
+## OCR 量化中的静默错误
 
-```text
-/cache/shitong/CPMOCR/quantize_awq_cpmoocr.py
-/cache/shitong/CPMOCR/quantize_gptq_cpmoocr.py
-/cache/shitong/CPMOCR/verify_quantized_cpmoocr.py
-/cache/shitong/MiniCPM-V-4_6/latest/quantize_awq_instruct.py
-/cache/shitong/MiniCPM-V-4_6/latest/quantize_gptq_instruct.py
-```
+在 MiniCPM-V OCR checkpoint 上发现，Transformers 5.x 加载后可能不报告 missing keys，但 `vpm.*` 视觉塔仍保留随机初始化值。如果直接量化，LLM 会基于错误的视觉特征做校准；仅在保存后覆盖视觉塔权重也无法修复已经完成的量化过程。
+
+处理方式是在量化前从原始 safetensors 恢复视觉塔、resampler 和 merger，并逐张量确认加载值与 checkpoint 一致。校准数据目录不存在或 OCR 文本数量过少时直接报错，避免静默退化到少量固定 prompt。
+
+## 量化产物验证
+
+量化完成后不能只检查模型能否保存，还需要验证：
+
+1. 视觉塔、resampler 和 merger 与 FP checkpoint 位级一致；
+2. LLM 中存在数量匹配的 `qweight`、`qzeros` 和 `scales`；
+3. packed 模块旁没有残留的全精度 `.weight`；
+4. 可选执行一次前向，确认 logits 有限且视觉塔不是初始化状态。
